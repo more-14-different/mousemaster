@@ -98,8 +98,8 @@ public class WindowsPlatform implements Platform {
         keyboard.update(delta);
         sanityCheckCurrentlyPressedKeys(delta);
         enforceWindowsTopmostTimer -= delta;
-        if (enforceWindowsTopmostTimer < 0) {
-            // Every 200ms.
+        // Every 200ms, but not during a transition: SetWindowPos would cost it a frame.
+        if (enforceWindowsTopmostTimer < 0 && !overlay.hintTransitionAnimating()) {
             enforceWindowsTopmostTimer = 0.2;
             overlay.setTopmost();
         }
@@ -140,10 +140,13 @@ public class WindowsPlatform implements Platform {
             overlay.mouseMoved(lastMousePosition);
         }
         pumpEvents();
+        // A hint transition's frames are painted once per iteration, so this sleep is what its
+        // first frame waits on.
+        long sleepMillis = overlay.hintTransitionAnimating() ? 1 : 10;
         long beforeTime = System.nanoTime();
         while (true) {
             long currentTime = System.nanoTime();
-            if ((currentTime - beforeTime) / 1e6 >= 10)
+            if ((currentTime - beforeTime) / 1e6 >= sleepMillis)
                 break;
             Thread.sleep(1);
             pumpEvents();
@@ -176,14 +179,14 @@ public class WindowsPlatform implements Platform {
         for (Mode mode : newModeMap.modes()) {
             newHintMeshConfigurations.add(mode.hintMesh());
         }
+        if (oldModeMap != null) {
+            logger.debug("Flushing overlay cache because the configuration was reloaded");
+            overlay.flushCache();
+        }
         if (!newHintMeshConfigurations.equals(oldHintMeshConfigurations)) {
-            if (oldModeMap != null) {
-                logger.debug(
-                        "Flushing overlay cache because hint mesh configurations have changed");
-                overlay.flushCache();
-            }
             overlay.preWarmFontStyles(newHintMeshConfigurations);
             overlay.preWarmHintMeshWindows();
+            overlay.preWarmIndicatorWindow();
         }
         this.modeMap = newModeMap;
         WinDef.POINT mousePosition = mouse.findMousePosition();

@@ -51,7 +51,9 @@ public final class HintMeshRenderer {
     /** The in-flight container crop and the container it animates, so a grid whose boxes cannot
      *  morph clips its border layer in lockstep with it. */
     private QVariantAnimation cropAnimation;
+    private long cropAnimationStartNanos;
     private QWidget croppedContainer;
+    private final TransitionMetrics transitionMetrics = new TransitionMetrics();
     private boolean showingHintMesh;
     /** Set when a crop that was zooming into a selected hint's box is abandoned because the incoming
      *  grid does not continue that drill; the incoming grid then fades in instead of popping. */
@@ -87,6 +89,59 @@ public final class HintMeshRenderer {
      *  superseded it draws its own: both colors are translucent, so drawing both on the outline they
      *  share would add up their opacity. A drill interrupted more than once stacks several of these. */
     private record OutgoingBorders(List<HintBox> boxes, Rectangle bounds, Rectangle covered) {
+    }
+
+    /** What one transition's crop cost. Work on the main thread drops whole frames, so the largest
+     *  gap between them, not the average frame rate, is what reads as a stutter. */
+    private static final class TransitionMetrics {
+
+        private int frameCount;
+        private long startNanos;
+        private long previousFrameNanos;
+        private long maxGapMillis;
+        private long paintMaxNanos;
+        private int durationMillis;
+        private String clipping;
+        private final StringBuilder gaps = new StringBuilder();
+
+        void started(int durationMillis, String clipping) {
+            frameCount = 0;
+            maxGapMillis = 0;
+            paintMaxNanos = 0;
+            gaps.setLength(0);
+            this.durationMillis = durationMillis;
+            this.clipping = clipping;
+            startNanos = System.nanoTime();
+            previousFrameNanos = startNanos;
+        }
+
+        void frameDrawn() {
+            long now = System.nanoTime();
+            long gapMillis = (long) ((now - previousFrameNanos) / 1e6);
+            previousFrameNanos = now;
+            frameCount++;
+            maxGapMillis = Math.max(maxGapMillis, gapMillis);
+            gaps.append(gaps.isEmpty() ? "" : ",").append(gapMillis);
+        }
+
+        /** The frame's paint; what is left of its gap is Qt's and DWM's, not ours. */
+        void painted(long nanos) {
+            paintMaxNanos = Math.max(paintMaxNanos, nanos);
+        }
+
+        void log() {
+            if (!logger.isTraceEnabled())
+                return;
+            long elapsedMillis = (long) ((System.nanoTime() - startNanos) / 1e6);
+            logger.trace("Hint transition: " + frameCount + " frames over " + elapsedMillis +
+                         "ms (" + durationMillis + "ms requested), max gap " + maxGapMillis +
+                         "ms, " + clipping + ", paint " + millis(paintMaxNanos) +
+                         "ms max, gaps " + gaps);
+        }
+
+        private static String millis(long nanos) {
+            return String.format("%.1f", nanos / 1e6);
+        }
     }
 
     private static Rectangle bounds(List<Rectangle> rectangles) {
@@ -131,6 +186,14 @@ public final class HintMeshRenderer {
         return showingHintMesh;
     }
 
+    public boolean transitionAnimating() {
+        for (HintMeshWindow hintMeshWindow : hintMeshWindows.values())
+            for (QVariantAnimation animation : hintMeshWindow.animations())
+                if (animation.getState() == QAbstractAnimation.State.Running)
+                    return true;
+        return false;
+    }
+
     /** The Qt windows, for the platform's magnification and capture-exclusion loops. */
     public Collection<TransparentWindow> windows() {
         List<TransparentWindow> windows = new ArrayList<>();
@@ -142,6 +205,9 @@ public final class HintMeshRenderer {
     /** Runs one unit of deferred work per frame: the build this frame, the pixmap cache the
      *  next. The platform overlay drives this once per frame. */
     public void runPendingWork() {
+        advanceCropAnimationToFirstFrame();
+        if (hintMeshFadeAnimator != null)
+            hintMeshFadeAnimator.advanceToFirstFrame();
         if (setUncachedHintMeshWindowRunnable != null) {
             pumpDuringHintBuild = true;
             setUncachedHintMeshWindowRunnable.run();
@@ -173,6 +239,9 @@ public final class HintMeshRenderer {
         hintBoxGeometriesByHintMeshKey.clear();
         for (HintMeshWindow hintMeshWindow : hintMeshWindows.values())
             hintMeshWindow.lastHintMeshKeyReference().set(null);
+        HintLabel.clearOutlineCache();
+        QtHintFont.clearCaches();
+        QtColorUtil.clearCaches();
     }
 
     public boolean setHintMesh(HintMesh hintMesh, Zoom zoom, boolean hintMatch,
@@ -266,6 +335,7 @@ public final class HintMeshRenderer {
             }
             hintMeshWindow.animations().clear();
             hintMeshWindow.animationCallbacks().clear();
+            cropAnimation = null;
             BorderMorph lineMorph = borderMorphByWindow.remove(hintMeshWindow.window());
             if (lineMorph != null)
                 stopBorderMorph(lineMorph);
@@ -399,7 +469,7 @@ public final class HintMeshRenderer {
             return pixmap() != null && !pixmap().isNull();
         }
 
-        /** Crops to {@code r}, scheduling a paint of the union of the old and new crop (the whole
+        /** Crops to {@code r}, scheduling a paint of the band between the old and new crop (the whole
          *  label on the first crop, to clear any full paint before it). Uses update(), not repaint():
          *  repaint() flushes immediately, so a container's CompositionMode_Clear would reach the
          *  screen before the border layer repaints on top, blanking the border lines for a frame.
@@ -425,6 +495,12 @@ public final class HintMeshRenderer {
 
         @Override
         protected void paintEvent(QPaintEvent event) {
+            long before = System.nanoTime();
+            paint(event);
+            transitionMetrics.painted(System.nanoTime() - before);
+        }
+
+        private void paint(QPaintEvent event) {
             if (crop != null) {
                 QPainter painter = new QPainter(this);
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear);
@@ -522,8 +598,8 @@ public final class HintMeshRenderer {
                     QRect visible = visibleRect(container);
                     mergedX = Math.min(mergedX, visible.x());
                     mergedY = Math.min(mergedY, visible.y());
-                    mergedRight = Math.max(mergedRight, visible.right());
-                    mergedBottom = Math.max(mergedBottom, visible.bottom());
+                    mergedRight = Math.max(mergedRight, visible.x() + visible.width());
+                    mergedBottom = Math.max(mergedBottom, visible.y() + visible.height());
                     visible.dispose();
                 }
                 QWidget mergedContainer = new QWidget(window);
@@ -560,6 +636,7 @@ public final class HintMeshRenderer {
             animation.dispose();
         hintMeshWindow.animations.clear();
         hintMeshWindow.animationCallbacks.clear();
+        cropAnimation = null;
         // When QT_ENABLE_HIGHDPI_SCALING is not 0 (e.g. Linux/macOS), then
         // devicePixelRatio will be the screen's scale.
         double qtScaleFactor = QApplication.primaryScreen().devicePixelRatio();
@@ -664,7 +741,7 @@ public final class HintMeshRenderer {
                                 transitionAnimationDuration);
                         if (isHintGrid) {
                             // Defer the pixmap cache grab to the next frame so the hint mesh is shown
-                            // immediately; the grab is expensive (~370ms at 4K).
+                            // immediately; the grab is expensive (~90ms at 4K when cold).
                             cacheQtHintWindowIntoPixmapRunnable = () ->
                                 cacheQtHintWindowIntoPixmap(window, container, hintMeshKey, hintMesh, boxes);
                         }
@@ -745,7 +822,7 @@ public final class HintMeshRenderer {
                             hintContainerAnimation(beginRect, endRect, animationDuration);
                     beginRect.dispose();
                     HintContainerAnimationChanged animationChanged = new HintContainerAnimationChanged(
-                            oldContainer);
+                            oldContainer, this);
                     animation.valueChanged.connect(animationChanged);
                     HintContainerAnimationFinished animationFinished =
                             new HintContainerAnimationFinished(oldContainer, oldContainer,
@@ -759,7 +836,7 @@ public final class HintMeshRenderer {
                     hintMeshWindow.animationCallbacks.add(animationFinished);
                     cropAnimation = animation;
                     croppedContainer = oldContainer;
-                    animation.start();
+                    startCropAnimation(animation, oldContainer);
                 }
             }
             else if (animateTransition && (newContainsOld || continueCropIntoNew)) {
@@ -784,7 +861,7 @@ public final class HintMeshRenderer {
                         animationDuration);
                 beginRect.dispose();
                 HintContainerAnimationChanged animationChanged =
-                        new HintContainerAnimationChanged(newContainer);
+                        new HintContainerAnimationChanged(newContainer, this);
                 animation.valueChanged.connect(animationChanged);
                 HintContainerAnimationFinished animationFinished =
                         new HintContainerAnimationFinished(null, newContainer,
@@ -795,7 +872,7 @@ public final class HintMeshRenderer {
                 hintMeshWindow.animationCallbacks.add(animationFinished);
                 cropAnimation = animation;
                 croppedContainer = newContainer;
-                animation.start();
+                startCropAnimation(animation, newContainer);
                 oldContainer.setParent(null);
                 oldContainer.disposeLater();
             }
@@ -1085,13 +1162,16 @@ public final class HintMeshRenderer {
     public static class HintContainerAnimationChanged implements QMetaObject.Slot1<Object> {
 
         private final QWidget container;
+        private final HintMeshRenderer renderer;
 
-        public HintContainerAnimationChanged(QWidget container) {
+        public HintContainerAnimationChanged(QWidget container, HintMeshRenderer renderer) {
             this.container = container;
+            this.renderer = renderer;
         }
 
         @Override
         public void invoke(Object arg) {
+            renderer.transitionMetrics.frameDrawn();
             cropOrMask(container, (QRect) arg);
         }
     }
@@ -1119,8 +1199,32 @@ public final class HintMeshRenderer {
                 oldContainer.setParent(null);
                 oldContainer.disposeLater();
             }
+            renderer.transitionMetrics.log();
             renderer.hintContainerAnimationEnded();
         }
+    }
+
+    private void startCropAnimation(QVariantAnimation animation, QWidget container) {
+        transitionMetrics.started(animation.getDuration(), clipping(container));
+        cropAnimationStartNanos = System.nanoTime();
+        animation.start();
+    }
+
+    /** Qt withholds a newly started animation's first value for about two timer intervals. */
+    private void advanceCropAnimationToFirstFrame() {
+        if (cropAnimation == null || cropAnimation.getCurrentTime() != 0 ||
+            cropAnimation.getState() != QAbstractAnimation.State.Running)
+            return;
+        cropAnimation.setCurrentTime(
+                (int) ((System.nanoTime() - cropAnimationStartNanos) / 1_000_000));
+    }
+
+    /** Why a container clips the way it does: a pixmap is cropped (cheap), anything else is masked
+     *  (recomposites the whole window every frame). */
+    private static String clipping(QWidget container) {
+        if (container instanceof ClearBackgroundQLabel label && label.cropCapable())
+            return "cropped";
+        return "masked";
     }
 
     private void hintContainerAnimationEnded() {
@@ -1778,6 +1882,7 @@ public final class HintMeshRenderer {
         private QFont decorationLabelFont;
         private QColor decorationLabelColor;
         private int decorationLabelX, decorationLabelY;
+        private int decorationLabelWidth, decorationLabelAscent, decorationLabelDescent;
 
         public HintBox(Hint hint, int borderLength, int borderThickness, QColor color, QColor borderColor,
                        boolean isHintPartOfGrid,
@@ -1826,9 +1931,31 @@ public final class HintMeshRenderer {
             this.decorationLabelColor = labelStyle.color();
             if (!label.isEmpty()) {
                 QFontMetrics metrics = labelStyle.metrics();
-                this.decorationLabelX = (width - metrics.horizontalAdvance(label)) / 2;
+                int advance = metrics.horizontalAdvance(label);
+                this.decorationLabelX = (width - advance) / 2;
                 this.decorationLabelY = middleBaselineY(verticalAlignment, height, metrics, label);
+                this.decorationLabelWidth = advance;
+                this.decorationLabelAscent = metrics.ascent();
+                this.decorationLabelDescent = metrics.descent();
             }
+        }
+
+        /** Where this depth's decoration labels put ink, in the coordinates they are painted in.
+         *  Descends accumulating the offset paintDecorationLabels translates by. */
+        void collectDecorationLabelBounds(int depth, int offsetX, int offsetY,
+                                          List<Rectangle> bounds) {
+            if (depth == 0) {
+                if (decorationLabel != null && !decorationLabel.isEmpty()
+                    && decorationLabelFont != null)
+                    bounds.add(new Rectangle(offsetX + x + decorationLabelX,
+                            offsetY + y + decorationLabelY - decorationLabelAscent,
+                            decorationLabelWidth,
+                            decorationLabelAscent + decorationLabelDescent));
+                return;
+            }
+            for (HintBox decorationBox : decorationBoxes)
+                decorationBox.collectDecorationLabelBounds(depth - 1, offsetX + x,
+                        offsetY + y, bounds);
         }
 
         public void move(int x, int y) {
@@ -1858,34 +1985,27 @@ public final class HintMeshRenderer {
                 // the background does not bleed outside the border at corners.
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, true);
                 if (borderThickness != 0) {
-                    QBrush brush = color.alpha() != 0 ? new QBrush(color) : new QBrush(Qt.BrushStyle.NoBrush);
-                    painter.setBrush(brush);
-                    QPen pen = createPen(borderColor, borderThickness);
-                    painter.setPen(pen);
+                    painter.setBrush(color.alpha() != 0 ? QtColorUtil.qBrush(color) :
+                            QtColorUtil.noBrush());
+                    painter.setPen(createPen(borderColor, borderThickness));
                     int offset = borderThickness / 2;
                     painter.drawRoundedRect(offset, offset,
                             width - borderThickness, height - borderThickness,
                             borderRadius, borderRadius);
-                    pen.dispose();
-                    brush.dispose();
                 }
                 else if (color.alpha() != 0) {
-                    QBrush brush = new QBrush(color);
-                    painter.setBrush(brush);
+                    painter.setBrush(QtColorUtil.qBrush(color));
                     painter.setPen(Qt.PenStyle.NoPen);
                     painter.drawRoundedRect(0, 0, width, height, borderRadius, borderRadius);
-                    brush.dispose();
                 }
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, false);
             }
             else {
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, false);
                 if (color.alpha() != 0) {
-                    QBrush brush = new QBrush(color);
-                    painter.setBrush(brush);
+                    painter.setBrush(QtColorUtil.qBrush(color));
                     painter.setPen(Qt.PenStyle.NoPen);
                     painter.drawRoundedRect(0, 0, width, height, 0, 0);
-                    brush.dispose();
                 }
                 if (borderThickness != 0)
                     drawBorders(painter);
@@ -1942,8 +2062,7 @@ public final class HintMeshRenderer {
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver);
             if (color.alpha() != 0) {
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, borderRadius > 0);
-                QBrush brush = new QBrush(color);
-                painter.setBrush(brush);
+                painter.setBrush(QtColorUtil.qBrush(color));
                 painter.setPen(Qt.PenStyle.NoPen);
                 if (borderRadius > 0 && borderThickness != 0) {
                     // The border strokes this same inset rect on its own layer; filling it (not the
@@ -1956,7 +2075,6 @@ public final class HintMeshRenderer {
                 }
                 else
                     painter.drawRoundedRect(0, 0, width, height, borderRadius, borderRadius);
-                brush.dispose();
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, false);
             }
             for (HintBox decorationBox : decorationBoxes)
@@ -1973,16 +2091,12 @@ public final class HintMeshRenderer {
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver);
             if (borderRadius > 0) {
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, true);
-                QBrush brush = new QBrush(Qt.BrushStyle.NoBrush);
-                painter.setBrush(brush);
-                QPen pen = createPen(borderColor, borderThickness);
-                painter.setPen(pen);
+                painter.setBrush(QtColorUtil.noBrush());
+                painter.setPen(createPen(borderColor, borderThickness));
                 int offset = borderThickness / 2;
                 painter.drawRoundedRect(offset, offset,
                         width - borderThickness, height - borderThickness,
                         borderRadius, borderRadius);
-                pen.dispose();
-                brush.dispose();
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, false);
             }
             else {
@@ -2000,9 +2114,7 @@ public final class HintMeshRenderer {
         public void paintOpaque(QPainter painter) {
             painter.save();
             painter.translate(x, y);
-            QColor opaque = new QColor(255, 255, 255, 255);
-            QBrush opaqueBrush = new QBrush(opaque);
-            painter.setBrush(opaqueBrush);
+            painter.setBrush(QtColorUtil.opaqueWhiteBrush());
             painter.setPen(Qt.PenStyle.NoPen);
             if (borderRadius > 0) {
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, true);
@@ -2012,8 +2124,6 @@ public final class HintMeshRenderer {
             else {
                 painter.drawRect(0, 0, width, height);
             }
-            opaqueBrush.dispose();
-            opaque.dispose();
             painter.restore();
         }
 
@@ -2228,8 +2338,6 @@ public final class HintMeshRenderer {
                     bottomRightStart,
                     right + 1
             );
-            edgePen.dispose();
-            insidePen.dispose();
         }
 
         private void drawVerticalGridLine(
@@ -2248,13 +2356,10 @@ public final class HintMeshRenderer {
                 return;
             if (y1 > y2)
                 return;
-            painter.setPen(isEdge ? edgePen : insidePen);
-            QPen currentPen = painter.pen();
-            if (currentPen.width() == 0) {
-                currentPen.dispose();
+            QPen pen = isEdge ? edgePen : insidePen;
+            if (pen.width() == 0)
                 return;
-            }
-            currentPen.dispose();
+            painter.setPen(pen);
             int x = xBase + (isEdge ? edgeOffset : insideOffset);
             painter.drawLine(x, y1, x, y2);
         }
@@ -2275,23 +2380,18 @@ public final class HintMeshRenderer {
                 return;
             if (x1 > x2)
                 return;
-            painter.setPen(isEdge ? edgePen : insidePen);
-            QPen currentPen = painter.pen();
-            if (currentPen.width() == 0) {
-                currentPen.dispose();
+            QPen pen = isEdge ? edgePen : insidePen;
+            if (pen.width() == 0)
                 return;
-            }
-            currentPen.dispose();
+            painter.setPen(pen);
             int y = yBase + (isEdge ? edgeOffset : insideOffset);
             painter.drawLine(x1, y, x2, y);
         }
 
         private QPen createPen(QColor color, int penWidth) {
-            QPen pen = new QPen(color);
             // Default is square cap.
-            pen.setCapStyle(Qt.PenCapStyle.FlatCap);
-            pen.setWidth(penWidth);
-            return pen;
+            return QtColorUtil.qPen(color, penWidth, Qt.PenCapStyle.FlatCap,
+                    Qt.PenJoinStyle.BevelJoin);
         }
 
     }
@@ -2299,18 +2399,39 @@ public final class HintMeshRenderer {
     private static int middleBaselineY(FontVerticalAlignment verticalAlignment,
                                        int boxHeight, QFontMetrics metrics, String text) {
         if (verticalAlignment == FontVerticalAlignment.MIDDLE) {
-            QRect tight = metrics.tightBoundingRect(text);
-            int y = (int) Math.round(boxHeight / 2.0 - tight.y() - tight.height() / 2.0);
-            tight.dispose();
-            return y;
+            Rectangle tight = QtHintFont.tightBounds(metrics, text);
+            return (int) Math.round(boxHeight / 2.0 - tight.y() - tight.height() / 2.0);
         }
         return (boxHeight + metrics.ascent() - metrics.descent()) / 2;
     }
 
     public static class HintLabel {
 
+        /** Refilled by every outline paint; painting is single-threaded. */
+        private static final QPainterPath outlinePath = new QPainterPath();
+        private static final Map<OutlineKey, OutlineImage> outlineImages = new HashMap<>();
+
+        static void clearOutlineCache() {
+            for (OutlineImage outline : outlineImages.values())
+                outline.image().dispose();
+            outlineImages.clear();
+        }
+
+        /** A glyph and where it sits in the label it belongs to. */
+        private record GlyphPlacement(String text, int x, int y) {
+        }
+
+        /** Everything the rasterized outline of a label depends on. */
+        private record OutlineKey(List<GlyphPlacement> glyphs, int rgba, int thickness) {
+        }
+
+        private record OutlineImage(QImage image, int x, int y) {
+        }
+
         private final QtHintFontStyle labelFontStyle;
         private final List<HintKeyText> keyTexts;
+        /** Only a non-grid hint's box is sized and placed to fit its label; a grid hint's box is its
+         *  cell, so its left and top are left at 0. */
         final int tightHintBoxLeft;
         final int tightHintBoxTop;
         final int tightHintBoxWidth;
@@ -2330,9 +2451,6 @@ public final class HintMeshRenderer {
             this.labelFontStyle = labelFontStyle;
 
             QFontMetrics labelMetrics = labelFontStyle.defaultStyle().metrics();
-            int y = middleBaselineY(verticalAlignment, boxHeight, labelMetrics,
-                    keySequence.stream().map(Key::hintLabel).collect(Collectors.joining()));
-
             double smallestColAlignedFontBoxWidth = hintKeyMaxXAdvance * keySequence.size();
             double smallestColAlignedFontBoxWidthPercent =
                     Math.min(1, smallestColAlignedFontBoxWidth / boxWidth);
@@ -2404,10 +2522,9 @@ public final class HintMeshRenderer {
                 // MIDDLE centers each key on its own tight bounds, not the whole label as one block.
                 int textY = middleBaselineY(verticalAlignment, boxHeight, keyMetrics, keyText);
                 if (!isHintPartOfGrid) {
-                    QRect tight = keyMetrics.tightBoundingRect(keyText);
+                    Rectangle tight = QtHintFont.tightBounds(keyMetrics, keyText);
                     tightLeft = Math.min(tightLeft, textX + tight.x());
                     tightRight = Math.max(tightRight, textX + tight.x() + tight.width());
-                    tight.dispose();
                 }
                 keyTexts.add(new HintKeyText(keyText, textX, textY, keyWidth,
                         isSelected, isFocused, isPrefix));
@@ -2428,12 +2545,15 @@ public final class HintMeshRenderer {
                 }
             }
             this.centeredBoxWidth = centeredBoxWidth;
-            int smallestHintBoxTop = y - labelFontStyle.defaultStyle().metrics().ascent();
-            int smallestHintBoxHeight = labelFontStyle.defaultStyle().metrics().height();
             this.tightHintBoxLeft = smallestHintBoxLeft;
-            this.tightHintBoxTop = smallestHintBoxTop;
+            this.tightHintBoxTop = isHintPartOfGrid ? 0 :
+                    middleBaselineY(verticalAlignment, boxHeight, labelMetrics,
+                            keySequence.stream()
+                                       .map(Key::hintLabel)
+                                       .collect(Collectors.joining()))
+                    - labelMetrics.ascent();
             this.tightHintBoxWidth = smallestHintBoxWidth;
-            this.tightHintBoxHeight = smallestHintBoxHeight;
+            this.tightHintBoxHeight = labelMetrics.height();
         }
 
         public void setFixedSize(int width, int height) {
@@ -2461,7 +2581,7 @@ public final class HintMeshRenderer {
         }
 
         private static QColor opaqueColor(QColor c) {
-            return c.alpha() == 255 ? c : new QColor(c.red(), c.green(), c.blue(), 255);
+            return QtColorUtil.opaque(c);
         }
 
         private QtFontStyle resolveKeyQtFontStyle(boolean isPrefix, boolean isSelected, boolean isFocused) {
@@ -2517,15 +2637,7 @@ public final class HintMeshRenderer {
                     continue;
                 if (labelFontStyle.perKeyFont())
                     painter.setFont(qtFontStyle.font());
-                if (forceOpaque) {
-                    QColor opaque = opaqueColor(color);
-                    painter.setPen(opaque);
-                    if (opaque != color)
-                        opaque.dispose();
-                }
-                else {
-                    painter.setPen(color);
-                }
+                painter.setPen(forceOpaque ? opaqueColor(color) : color);
                 painter.drawText(keyText.x() - left, keyText.y() - top, keyText.text());
             }
             painter.restore();
@@ -2547,23 +2659,59 @@ public final class HintMeshRenderer {
                 return;
             QColor outlineColor = forceOpaque ?
                     opaqueColor(qtFontStyle.outlineColor()) : qtFontStyle.outlineColor();
-            QPen outlinePen = new QPen(outlineColor);
-            outlinePen.setWidth(qtFontStyle.outlineThickness());
-            outlinePen.setJoinStyle(Qt.PenJoinStyle.RoundJoin);
-            painter.setPen(outlinePen);
+            List<GlyphPlacement> glyphs = new ArrayList<>(keyTexts.size());
+            for (HintKeyText keyText : keyTexts)
+                if (filter.test(keyText))
+                    glyphs.add(new GlyphPlacement(keyText.text(), keyText.x() - left,
+                            keyText.y() - top));
+            // Building and stroking a glyph outline costs ~85us, and a hint mesh draws the same
+            // handful of labels over and over, so each is rasterized once and blitted after.
+            OutlineImage outline = outlineImages.computeIfAbsent(
+                    new OutlineKey(glyphs, outlineColor.rgba(),
+                            qtFontStyle.outlineThickness()),
+                    key -> {
+                        // One path, stroked once: a path per glyph would stroke overlapping
+                        // glyphs twice.
+                        outlinePath.clear();
+                        for (GlyphPlacement glyph : key.glyphs())
+                            qtFontStyle.addTextPath(outlinePath, glyph.text(), glyph.x(),
+                                    glyph.y());
+                        return renderOutline(outlinePath, outlineColor,
+                                qtFontStyle.outlineThickness());
+                    });
+            if (outline != null)
+                painter.drawImage(outline.x(), outline.y(), outline.image());
+        }
+
+        /** Rasterizes the stroked path onto a transparent image, offset by whole pixels so the
+         *  stroke lands on the same subpixel phase as painting it directly would. */
+        private static OutlineImage renderOutline(QPainterPath path, QColor color,
+                                                   int thickness) {
+            QRectF strokeBounds = path.boundingRect();
+            int left = (int) Math.floor(strokeBounds.x()) - thickness - 1;
+            int top = (int) Math.floor(strokeBounds.y()) - thickness - 1;
+            int width = (int) Math.ceil(strokeBounds.x() + strokeBounds.width()) - left +
+                        thickness + 1;
+            int height = (int) Math.ceil(strokeBounds.y() + strokeBounds.height()) - top +
+                         thickness + 1;
+            strokeBounds.dispose();
+            if (width <= 0 || height <= 0)
+                return null;
+            QImage image = new QImage(width, height,
+                    QImage.Format.Format_ARGB32_Premultiplied);
+            QColor transparent = new QColor(0, 0, 0, 0);
+            image.fill(transparent);
+            transparent.dispose();
+            QPainter painter = new QPainter(image);
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, true);
+            painter.translate(-left, -top);
+            painter.setPen(QtColorUtil.qPen(color, thickness, Qt.PenCapStyle.SquareCap,
+                    Qt.PenJoinStyle.RoundJoin));
             painter.setBrush(Qt.BrushStyle.NoBrush);
-            QPainterPath outlinePath = new QPainterPath();
-            for (HintKeyText keyText : keyTexts) {
-                if (!filter.test(keyText))
-                    continue;
-                outlinePath.addText(keyText.x() - left, keyText.y() - top,
-                        qtFontStyle.font(), keyText.text());
-            }
-            painter.drawPath(outlinePath);
-            outlinePath.dispose();
-            outlinePen.dispose();
-            if (forceOpaque && outlineColor != qtFontStyle.outlineColor())
-                outlineColor.dispose();
+            painter.drawPath(path);
+            painter.end();
+            painter.dispose();
+            return new OutlineImage(image, left, top);
         }
 
         ShadowGroupKey shadowGroupKey(HintKeyText keyText) {
@@ -2576,6 +2724,9 @@ public final class HintMeshRenderer {
 
         void paintOpaqueFiltered(QPainter painter,
                                  Predicate<HintKeyText> filter) {
+            // Every label is offered to every shadow group, and most belong to none.
+            if (keyTexts.stream().noneMatch(filter))
+                return;
             painter.save();
             painter.translate(x, y);
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, true);
@@ -2607,10 +2758,7 @@ public final class HintMeshRenderer {
                     continue;
                 if (labelFontStyle.perKeyFont())
                     painter.setFont(qtFontStyle.font());
-                QColor opaque = opaqueColor(color);
-                painter.setPen(opaque);
-                if (opaque != color)
-                    opaque.dispose();
+                painter.setPen(opaqueColor(color));
                 painter.drawText(keyText.x() - left, keyText.y() - top, keyText.text());
             }
             painter.restore();
@@ -2671,8 +2819,12 @@ public final class HintMeshRenderer {
                     (box, painter) -> box.paintDecorationLabels(painter, labelDepth));
             layer.setGeometry(0, 0, containerWidth, containerHeight);
             QtFontStyle labelStyle = decorationStyles.get(depth).labelStyle();
-            if (labelStyle.shadowColor().alpha() == 0)
+            if (labelStyle.shadowColor().alpha() == 0 || labelStyle.invisible())
                 continue;
+            List<Rectangle> ink = new ArrayList<>();
+            for (HintBox box : boxes)
+                box.collectDecorationLabelBounds(labelDepth, 0, 0, ink);
+            layer.fitToInk(ink, shadowPadding(labelStyle), containerWidth, containerHeight);
             StackedShadowEffect effect = new StackedShadowEffect();
             effect.setBlurRadius(labelStyle.shadowBlurRadius());
             effect.setOffset(labelStyle.shadowHorizontalOffset(),
@@ -2696,6 +2848,10 @@ public final class HintMeshRenderer {
                                          int containerWidth,
                                          int containerHeight,
                                          double screenScale) {
+        // Shadowing a layer that draws nothing still costs a blur of the whole layer, which for a
+        // screen-sized hint mesh is tens of milliseconds.
+        if (style.invisible(hasSelectedKeys))
+            return;
         if (style.perKeyShadow()) {
             logger.debug("Hint label shadow: per-key shadow, pre-rendering per group");
             preRenderLabelShadow(layer, labels, style,
@@ -2708,6 +2864,10 @@ public final class HintMeshRenderer {
         if (!style.hasTransparency(hasSelectedKeys) &&
             defaultStyle.shadowStackCount() == 1) {
             logger.debug("Hint label shadow: opaque text, applying effect directly");
+            List<Rectangle> ink = new ArrayList<>();
+            for (HintLabel label : labels)
+                ink.add(new Rectangle(label.x, label.y, label.width, label.height));
+            layer.fitToInk(ink, shadowPadding(defaultStyle), containerWidth, containerHeight);
             StackedShadowEffect effect = new StackedShadowEffect();
             effect.setBlurRadius(defaultStyle.shadowBlurRadius());
             effect.setOffset(defaultStyle.shadowHorizontalOffset(),
@@ -2728,6 +2888,13 @@ public final class HintMeshRenderer {
             preRenderLabelShadow(layer, labels, style,
                     containerWidth, containerHeight, screenScale);
         }
+    }
+
+    /** How far the shadow of a glyph reaches past it: the blur, plus how far it is offset. */
+    private static int shadowPadding(QtFontStyle style) {
+        return (int) Math.ceil(style.shadowBlurRadius()) +
+               (int) Math.ceil(Math.max(Math.abs(style.shadowHorizontalOffset()),
+                       Math.abs(style.shadowVerticalOffset()))) + 2;
     }
 
     private void preRenderLabelShadow(HintPaintLayer layer,
@@ -2858,6 +3025,8 @@ public final class HintMeshRenderer {
         private final List<HintBox> boxes;
         private final List<HintLabel> labels;
         private final BiConsumer<HintBox, QPainter> boxPainter;
+        /** Where the layer sits when it covers only its ink; everything it paints shifts by it. */
+        private int originX, originY;
         // Pre-rendered shadow-only pixmap (null if no shadow or opaque text).
         private QPixmap shadowPixmap;
         private int shadowPixmapX, shadowPixmapY;
@@ -2877,6 +3046,29 @@ public final class HintMeshRenderer {
             this.boxes = boxes;
             this.labels = labels;
             this.boxPainter = boxPainter;
+        }
+
+        /**
+         * Covers {@code ink} (in container coordinates, padded) instead of the whole container,
+         * and shifts what it paints to match. A drop shadow effect blurs the layer's whole
+         * surface, and a hint mesh spanning a screen puts very little ink on most of it.
+         * Returns whether the layer was fitted: it is not when there is no ink to fit to.
+         */
+        boolean fitToInk(List<Rectangle> ink, int padding, int containerWidth,
+                         int containerHeight) {
+            if (ink.isEmpty())
+                return false;
+            Rectangle bounds = bounds(ink);
+            int left = Math.max(0, bounds.x() - padding);
+            int top = Math.max(0, bounds.y() - padding);
+            int right = Math.min(containerWidth, bounds.x() + bounds.width() + padding);
+            int bottom = Math.min(containerHeight, bounds.y() + bounds.height() + padding);
+            if (right <= left || bottom <= top)
+                return false;
+            originX = left;
+            originY = top;
+            setGeometry(left, top, right - left, bottom - top);
+            return true;
         }
 
         void setOutgoing(List<OutgoingBorders> outgoing) {
@@ -2903,8 +3095,8 @@ public final class HintMeshRenderer {
             crop = replaceCrop(crop, r);
         }
 
-        /** Disposes {@code current} and returns a copy of {@code r}, repainting the area either covers
-         *  (the whole layer on the first crop, to clear any full paint before it). update(), not
+        /** Disposes {@code current} and returns a copy of {@code r}, repainting the band between the
+         *  two (the whole layer on the first crop, to clear any full paint before it). update(), not
          *  repaint(): repaint() flushes immediately, so a container's Clear would reach the screen
          *  before the border layer repaints on top, blanking the border lines for a frame. */
         private QRect replaceCrop(QRect current, QRect r) {
@@ -2936,6 +3128,8 @@ public final class HintMeshRenderer {
         @Override
         protected void paintEvent(QPaintEvent event) {
             QPainter painter = new QPainter(this);
+            if (originX != 0 || originY != 0)
+                painter.translate(-originX, -originY);
             if (!outgoing.isEmpty() && outgoingCrop != null) {
                 QRect outgoingDirty = outgoingCrop.intersected(event.rect());
                 QRegion dirtyRegion = new QRegion(outgoingDirty);

@@ -25,6 +25,8 @@ public interface Overlay {
 
     void preWarmHintMeshWindows();
 
+    void preWarmIndicatorWindow();
+
     Rectangle activeWindowRectangle(double widthPct, double heightPct,
                                     int topInset, int bottomInset,
                                     int leftInset, int rightInset);
@@ -44,6 +46,8 @@ public interface Overlay {
     void setHintMesh(HintMesh hintMesh, Zoom zoom, boolean hintMatch);
 
     void hideHintMesh();
+
+    boolean hintTransitionAnimating();
 
     void animateHintMatch(Hint hint);
 

@@ -88,6 +88,10 @@ public class WindowsOverlay implements Overlay {
     @Override
     public void update(double delta) {
         hintMeshRenderer.runPendingWork();
+        if (gridRenderer != null)
+            gridRenderer.advanceAnimationsToFirstFrame();
+        if (indicatorRenderer != null)
+            indicatorRenderer.advanceAnimationsToFirstFrame();
         updateZoomWindow();
         // Deferred screenshot hide: the magnifier was shown by updateZoomWindow
         // on the previous frame (or by setZoom inside endScreenshotZoomAnimation).
@@ -176,6 +180,14 @@ public class WindowsOverlay implements Overlay {
 
     @Override
     public void setTopmost() {
+        long before = System.nanoTime();
+        enforceTopmost();
+        long durationMillis = (long) ((System.nanoTime() - before) / 1e6);
+        if (durationMillis >= 3)
+            logger.trace("Enforced topmost in " + durationMillis + "ms");
+    }
+
+    private void enforceTopmost() {
         List<WinDef.HWND> hwnds = new ArrayList<>();
         // First in the hwnds list means drawn on top.
         if (gridHwnd != null)
@@ -244,6 +256,10 @@ public class WindowsOverlay implements Overlay {
     }
 
     private void moveAndResizeIndicatorWindow(WinDef.POINT mousePosition) {
+        // The window is created before the first indicator is set, so that the mode the user
+        // switches into does not pay for it: there is nothing to place until then.
+        if (indicatorRenderer.currentIndicator() == null)
+            return;
         indicatorRenderer.reposition(mouseRectangle(mousePosition), mouse.cursorVisualCenter(),
                 WindowsScreen.findActiveScreen(mousePosition), currentZoom);
     }
@@ -319,6 +335,19 @@ public class WindowsOverlay implements Overlay {
         updateZoomExcludedWindows();
     }
 
+    /** Creating the indicator window costs as much as the first hint mesh window, and the mode
+     *  the user switches into pays it before its hints are built. */
+    @Override
+    public void preWarmIndicatorWindow() {
+        if (indicatorHwnd != null)
+            return;
+        long before = System.nanoTime();
+        createIndicatorWindow();
+        indicatorRenderer.preWarm();
+        logger.info("Pre-warmed the indicator window in " +
+                    (long) ((System.nanoTime() - before) / 1e6) + "ms");
+    }
+
     /**
      * Pre-warms the GDI font engine with all hint fonts from the configuration.
      * The first QFontMetrics.horizontalAdvance() call for a given font triggers lazy
@@ -374,6 +403,10 @@ public class WindowsOverlay implements Overlay {
                                     boolean allowFade,
                                     boolean renderAsCursor, boolean includeCursorGlyph) {
         Objects.requireNonNull(indicator);
+        if (!renderAsCursor && !indicatorIsCursor && indicatorRenderer != null &&
+            indicatorRenderer.showing() &&
+            indicator.equals(indicatorRenderer.currentIndicator()))
+            return;
         if (mouse.tryFindMousePosition() == null) {
             logger.warn("Unable to find mouse position for indicator");
             return;
@@ -852,6 +885,11 @@ public class WindowsOverlay implements Overlay {
     @Override
     public void hideHintMesh() {
         hintMeshRenderer.hideHintMesh();
+    }
+
+    @Override
+    public boolean hintTransitionAnimating() {
+        return hintMeshRenderer.transitionAnimating();
     }
 
     void mouseMoved(WinDef.POINT mousePosition) {

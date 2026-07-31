@@ -28,6 +28,11 @@ public final class IndicatorRenderer {
     private FadeAnimator fadeAnimator;
     private boolean showing;
 
+    public void advanceAnimationsToFirstFrame() {
+        if (fadeAnimator != null)
+            fadeAnimator.advanceToFirstFrame();
+    }
+
     /** Lazily creates the window and its widgets; the host styles winId() afterwards. */
     public TransparentWindow window() {
         if (window == null) {
@@ -38,6 +43,14 @@ public final class IndicatorRenderer {
             labelWidget = new IndicatorLabelWidget(window);
         }
         return window;
+    }
+
+    /** Installing a graphics effect for the first time initialises Qt machinery that costs
+     *  around 15ms, which the first mode to show an indicator would otherwise pay. */
+    public void preWarm() {
+        window();
+        widget.setGraphicsEffect(new IndicatorShadowEffect(widget, this));
+        widget.setGraphicsEffect(null);
     }
 
     public boolean showing() {
